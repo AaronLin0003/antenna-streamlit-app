@@ -3,11 +3,12 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import time
-from scipy.optimize import minimize # 引入 SciPy 強力優化庫
+from scipy.optimize import minimize
 
 # --- 1. 頁面設定 ---
 st.set_page_config(page_title="PyAntenna Pro", layout="wide", page_icon="📡")
 
+# CSS 優化介面
 st.markdown("""
     <style>
         .block-container {padding-top: 1rem; padding-bottom: 0rem;}
@@ -20,7 +21,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. 物理核心 ---
+# --- 2. 物理核心 (Vectorized Physics) ---
 class AntennaSystem:
     def __init__(self, Nx, Ny, freq, spacing, elem_gain, q, is_jio, is_sym):
         self.update_params(Nx, Ny, freq, spacing, elem_gain, q, is_jio, is_sym)
@@ -35,9 +36,11 @@ class AntennaSystem:
         d_lambda = spacing / lambda_val
         k = 2 * np.pi
         
+        # 1. 映射矩陣
         self.map_idx, self.num_genes = self._create_mapping(Nx, Ny, is_jio, is_sym)
         self.total_elements = Nx * Ny
         
+        # 2. 轉向向量
         self.angles = np.arange(-90, 90.5, 0.5)
         rads = np.deg2rad(self.angles)
         
@@ -47,11 +50,13 @@ class AntennaSystem:
         self.pos_x = X.flatten()
         self.pos_y = Y.flatten()
         
+        # XZ Cut
         u_xz = np.sin(rads)
         phase_xz = k * d_lambda * np.outer(self.pos_x, u_xz) 
         self.sv_xz = np.exp(1j * phase_xz)
         self.ep_xz = np.maximum(1e-6, np.cos(rads)) ** q 
         
+        # YZ Cut
         v_yz = np.sin(rads)
         phase_yz = k * d_lambda * np.outer(self.pos_y, v_yz)
         self.sv_yz = np.exp(1j * phase_yz)
@@ -85,7 +90,7 @@ class AntennaSystem:
         return mapping.flatten(), counter
 
     def calculate_pattern(self, population_genes):
-        # 支援單個體或群體
+        # 支援單一或多個體
         if population_genes.ndim == 1:
             population_genes = population_genes.reshape(1, -1)
             
@@ -104,7 +109,7 @@ class AntennaSystem:
         pat_yz = to_dbi(af_yz, self.ep_yz)
         return pat_xz, pat_yz
 
-# --- 3. 優化引擎 (含 PSO 與 Scipy Polish) ---
+# --- 3. 優化引擎 (Optimizer) ---
 class Optimizer:
     def __init__(self, sys_model: AntennaSystem, pop_size=50):
         self.sys = sys_model
@@ -113,14 +118,14 @@ class Optimizer:
         self.reset() 
 
     def reset(self):
-        # 初始化 population
+        # 初始化 population (第一個設為全0)
         self.pop = np.random.uniform(-180, 180, (self.pop_size, self.dim))
         self.pop[0] = np.zeros(self.dim)
         self.scores = np.full(self.pop_size, np.inf)
         self.best_idx = 0
         self.iteration = 0
         
-        # PSO 專用變數
+        # PSO 狀態變數
         self.velocities = np.zeros_like(self.pop)
         self.pbest_pos = np.copy(self.pop)
         self.pbest_score = np.full(self.pop_size, np.inf)
@@ -137,15 +142,17 @@ class Optimizer:
             peak_indices = np.argmax(pat, axis=1)
             peak_angles = self.sys.angles[peak_indices]
             
+            # 1. Peak Angle Error
             err_peak = (peak_angles - angle)**2 * 50
             
+            # 2. Gain Constraint
             err_gain = np.zeros(len(pat))
             low_gain = peak_vals < min_gain
             err_gain[low_gain] = (min_gain - peak_vals[low_gain])**2 * 500
             
+            # 3. Symmetry / Width
             target_level = peak_vals + bw_def
             half_w = width / 2
-            
             idx_l = np.searchsorted(self.sys.angles, angle - half_w)
             idx_r = np.searchsorted(self.sys.angles, angle + half_w)
             idx_l = np.clip(idx_l, 0, len(self.sys.angles)-1)
@@ -154,9 +161,9 @@ class Optimizer:
             row_idx = np.arange(len(pat))
             val_l = pat[row_idx, idx_l]
             val_r = pat[row_idx, idx_r]
-            
             err_sym = ((val_l - target_level)**2 + (val_r - target_level)**2) * 10
             
+            # 4. SLL Mask
             mask_start = angle - (width * 0.6)
             mask_end = angle + (width * 0.6)
             mask_zone_indices = (self.sys.angles < mask_start) | (self.sys.angles > mask_end)
@@ -177,42 +184,34 @@ class Optimizer:
     def step(self, algo_type, goals):
         self.iteration += 1
         
-        # 1. 評估當前 Cost
+        # 1. 計算 Score
         pat_xz, pat_yz = self.sys.calculate_pattern(self.pop)
         scores = self.evaluate(pat_xz, pat_yz, goals)
         
-        # 更新全域最佳
+        # 2. 更新全域最佳解 (Global Best)
         min_idx = np.argmin(scores)
         if scores[min_idx] < self.gbest_score:
             self.gbest_score = scores[min_idx]
             self.gbest_pos = self.pop[min_idx].copy()
             
         self.scores = scores
-        self.best_idx = min_idx # 用於顯示目前最佳
+        self.best_idx = min_idx
         
-        # 2. 演算法分支
+        # 3. 演算法邏輯
         if algo_type == "PSO (粒子群)":
-            # 更新 PBest
             improved = scores < self.pbest_score
             self.pbest_pos[improved] = self.pop[improved]
             self.pbest_score[improved] = scores[improved]
             
-            # PSO 參數
-            w = 0.7  # 慣性
-            c1 = 1.5 # 認知 (自我)
-            c2 = 1.5 # 社會 (群體)
-            
+            w, c1, c2 = 0.7, 1.5, 1.5
             r1 = np.random.rand(self.pop_size, self.dim)
             r2 = np.random.rand(self.pop_size, self.dim)
             
-            # 速度更新
             self.velocities = (w * self.velocities + 
                                c1 * r1 * (self.pbest_pos - self.pop) + 
                                c2 * r2 * (self.gbest_pos - self.pop))
             
-            # 位置更新
             self.pop += self.velocities
-            # 邊界處理 (Wrap -180 ~ 180)
             self.pop = (self.pop + 180) % 360 - 180
             
         elif algo_type == "DE (差分進化)":
@@ -222,65 +221,62 @@ class Optimizer:
             F = 0.5 + 0.3 * np.random.rand(self.pop_size, 1)
             mutant = self.pop[a] + F * (self.pop[b] - self.pop[c])
             mutant = (mutant + 180) % 360 - 180 
-            CR = 0.8
-            cross = np.random.rand(self.pop_size, self.dim) < CR
+            cross = np.random.rand(self.pop_size, self.dim) < 0.8
             trial = np.where(cross, mutant, self.pop)
             t_xz, t_yz = self.sys.calculate_pattern(trial)
             t_scores = self.evaluate(t_xz, t_yz, goals)
             better = t_scores < scores
             self.pop[better] = trial[better]
-            self.scores[better] = t_scores[better]
             
         elif algo_type == "GA (基因算法)":
-            # 略微簡化以提升速度
+            sorted_idx = np.argsort(scores)
+            elite_count = max(1, int(self.pop_size * 0.1))
+            elites = self.pop[sorted_idx[:elite_count]]
             p1 = np.random.randint(0, self.pop_size, self.pop_size)
             p2 = np.random.randint(0, self.pop_size, self.pop_size)
             winners = np.where((scores[p1] < scores[p2])[:, None], self.pop[p1], self.pop[p2])
             mask = np.random.rand(self.pop_size, self.dim) < 0.5
             children = np.where(mask, winners, np.roll(winners, 1, axis=0))
             noise = np.random.normal(0, 10, (self.pop_size, self.dim))
-            children += noise # 輕微變異
-            children = (children + 180) % 360 - 180
+            children = (children + noise + 180) % 360 - 180
             self.pop = children
-            self.pop[0] = self.gbest_pos # Elitism
+            self.pop[:elite_count] = elites
+            
+        elif algo_type == "Random (隨機)":
+            self.pop = np.random.uniform(-180, 180, (self.pop_size, self.dim))
+            # 保持 gbest 不變
 
         return self.gbest_score
 
     def polish(self, goals):
-        """使用梯度下降法 (Gradient Descent) 進行最終微調"""
-        # 定義給 scipy 用的單一目標函數
+        """Scipy L-BFGS-B 精修"""
         def objective(x):
-            # x is shape (dim,)
             pop_wrapper = x.reshape(1, -1)
             p_xz, p_yz = self.sys.calculate_pattern(pop_wrapper)
             cost = self.evaluate(p_xz, p_yz, goals)
             return cost[0]
 
-        # 從目前全域最佳解開始
         start_pos = self.gbest_pos
-        
-        # 執行 L-BFGS-B 優化 (Python 的強力數學優化器)
         res = minimize(objective, start_pos, method='L-BFGS-B', bounds=[(-180, 180)]*self.dim, options={'maxiter': 50})
         
-        # 更新結果
         self.pop[0] = res.x
         self.gbest_pos = res.x
         self.gbest_score = res.fun
         return res.fun
 
-# --- 4. UI Layout & Session State ---
+# --- 4. UI 佈局 (UI Layout) ---
 
 if 'opt' not in st.session_state:
     st.session_state.opt = None
 if 'running' not in st.session_state:
     st.session_state.running = False
 
-# Sidebar
+# Sidebar Config
 with st.sidebar:
     st.header("🛠️ 陣列配置")
     c1, c2 = st.columns(2)
-    Nx = c1.number_input("Nx (X軸)", 1, 64, 4)
-    Ny = c2.number_input("Ny (Y軸)", 1, 64, 8)
+    Nx = c1.number_input("Nx", 1, 64, 4)
+    Ny = c2.number_input("Ny", 1, 64, 8)
     freq = c1.number_input("Freq (GHz)", 1.0, 100.0, 28.0)
     space = c2.number_input("Spacing (mm)", 1.0, 100.0, 5.35)
     gain = c1.number_input("Elem Gain", -50.0, 50.0, 5.0)
@@ -294,7 +290,7 @@ with st.sidebar:
         st.session_state.opt = None 
         st.session_state.running = False
         st.session_state.last_cfg = config_id
-        st.toast("陣列結構變更，已重置系統", icon="🔄")
+        st.toast("配置變更，系統已重置", icon="🔄")
 
     st.divider()
     st.header("🎯 目標設定")
@@ -311,13 +307,13 @@ with st.sidebar:
     yz_sll = st.number_input("YZ SLL (dBc)", 0, 60, 15)
     
     st.divider()
-    st.header("⚙️ 演算法控制")
-    # 新增 PSO 選項
-    algo = st.selectbox("Algorithm", ["PSO (粒子群)", "DE (差分進化)", "GA (基因算法)"])
-    min_gain_val = st.number_input("Min Gain (dBi)", -20.0, 50.0, 10.0)
+    st.header("⚙️ 演算法")
+    algo = st.selectbox("Method", ["PSO (粒子群)", "DE (差分進化)", "GA (基因算法)", "Random (隨機)"])
+    min_gain_val = st.number_input("Min Gain", -20.0, 50.0, 10.0)
     bw_def = st.number_input("BW Def (dB)", -20.0, -0.1, -3.0)
-    mask_w = st.slider("Mask Penalty", 1, 500, 50)
+    mask_w = st.slider("Penalty", 1, 500, 50)
     
+    # 控制按鈕
     col_a, col_b = st.columns(2)
     if col_a.button("▶ 開始", type="primary"):
         st.session_state.running = True
@@ -327,14 +323,13 @@ with st.sidebar:
         st.rerun()
         
     col_c, col_d = st.columns(2)
-    # 新增 Polish 按鈕
-    polish_btn = col_c.button("✨ 精修 (Polish)")
+    polish_btn = col_c.button("✨ 精修")
     if col_d.button("🔄 重置"):
         if st.session_state.opt: st.session_state.opt.reset() 
         st.session_state.running = False
         st.rerun()
 
-# --- 5. 初始化 ---
+# --- 5. 初始化與參數更新 ---
 if st.session_state.opt is None:
     sys = AntennaSystem(Nx, Ny, freq, space, gain, q, jio, sym)
     st.session_state.opt = Optimizer(sys, pop_size=50)
@@ -348,14 +343,16 @@ goals = {
     'bw_def': bw_def, 'min_gain': min_gain_val, 'mask_w': mask_w
 }
 
-# --- 6. Polish 邏輯 ---
+# --- 6. Polish 執行 (Blocking) ---
 if polish_btn:
-    st.session_state.running = False # 暫停自動跑
-    with st.spinner("正在進行梯度下降微調 (Gradient Descent Polishing)..."):
+    st.session_state.running = False
+    with st.spinner("正在進行梯度微調..."):
         final_cost = opt.polish(goals)
-    st.success(f"精修完成！Cost 降至: {final_cost:.6f}")
+    st.success(f"精修完成！Cost: {final_cost:.6f}")
 
-# --- 7. 靜態容器 ---
+# --- 7. 渲染邏輯 (Visualization) ---
+
+# 靜態容器佔位
 metric_spot = st.empty()
 col_g1, col_g2 = st.columns(2)
 with col_g1: xz_spot = st.empty()
@@ -363,12 +360,11 @@ with col_g2: yz_spot = st.empty()
 table_spot = st.empty()
 status_spot = st.empty()
 
-# --- 8. 更新邏輯 ---
 def update_view():
-    # 這裡顯示的是 Global Best (gbest)，因為在 PSO 中 gbest 才是最重要的
+    # 顯示 Global Best
     best_genes = opt.gbest_pos
     
-    # 這裡需要 reshpae 成 (1, dim) 才能餵給 calculate_pattern
+    # 計算場型
     pat_xz, pat_yz = opt.sys.calculate_pattern(best_genes.reshape(1, -1))
     pat_xz = pat_xz.flatten()
     pat_yz = pat_yz.flatten()
@@ -378,64 +374,83 @@ def update_view():
     pk_yz = np.max(pat_yz)
     cost = opt.gbest_score
     
-    # Metrics
+    # 1. Metrics
     with metric_spot.container():
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Iterations", opt.iteration)
-        c2.metric("Best Cost", f"{cost:.4f}" if not np.isinf(cost) else "0.0")
-        c3.metric("XZ Peak", f"{pk_xz:.2f} dBi")
-        c4.metric("YZ Peak", f"{pk_yz:.2f} dBi")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Iterations", opt.iteration)
+        m2.metric("Best Cost", f"{cost:.4f}" if not np.isinf(cost) else "0.0")
+        m3.metric("XZ Peak", f"{pk_xz:.2f} dBi")
+        m4.metric("YZ Peak", f"{pk_yz:.2f} dBi")
         
-    # Charts
-    def plot_cut(spot, pat, peak, ang, bw, sll, title, key_id):
-        floor = peak - 60
-        pat_vis = np.maximum(pat, floor)
+    # 2. Plotly Charts (Fixed Scale & Visual Clamp)
+    floor = max(pk_xz, pk_yz) - 60
+    pat_xz_vis = np.maximum(pat_xz, floor)
+    pat_yz_vis = np.maximum(pat_yz, floor)
+    max_y = gain + 10*np.log10(Nx*Ny) + 5
+    
+    def create_fig(pat, peak, ang, bw, sll, title):
         fig = go.Figure()
-        
-        # Mask & SLL
+        # Mask Zone
         fig.add_shape(type="rect", x0=ang-bw/2, x1=ang+bw/2, y0=floor, y1=peak+50, 
                       fillcolor="rgba(46, 204, 113, 0.1)", line_width=0)
+        # SLL Line
         mask_val = peak - sll
         fig.add_shape(type="line", x0=-90, x1=90, y0=mask_val, y1=mask_val, 
                       line=dict(color="red", width=2, dash="dot"))
+        # Pattern Trace
+        fig.add_trace(go.Scatter(x=angles, y=pat, mode='lines', line=dict(width=3)))
         
-        # Trace
-        fig.add_trace(go.Scatter(x=angles, y=pat_vis, mode='lines', line=dict(width=3)))
-        
-        max_possible_gain = gain + 10*np.log10(Nx*Ny) + 5
         fig.update_layout(
             title=title, xaxis_title="Angle", yaxis_title="dBi",
-            yaxis=dict(range=[floor, max_possible_gain]), 
-            xaxis=dict(range=[-90, 90]),
+            yaxis=dict(range=[floor, max_y]), xaxis=dict(range=[-90, 90]),
             height=350, margin=dict(l=20, r=20, t=40, b=20)
         )
-        spot.plotly_chart(fig, use_container_width=True, key=key_id)
+        return fig
 
-    if xz_en: plot_cut(xz_spot, pat_xz, pk_xz, xz_ang, xz_bw, xz_sll, "XZ Cut", "xz_chart")
-    if yz_en: plot_cut(yz_spot, pat_yz, pk_yz, yz_ang, yz_bw, yz_sll, "YZ Cut", "yz_chart")
-    
-    # Table
+    # 這裡使用固定的 Key，避免 Duplicate ID 錯誤，且不會閃爍
+    if xz_en:
+        fig = create_fig(pat_xz_vis, pk_xz, xz_ang, xz_bw, xz_sll, "XZ Cut")
+        xz_spot.plotly_chart(fig, use_container_width=True, key="chart_xz_fixed")
+    else:
+        xz_spot.info("XZ Cut Disabled")
+        
+    if yz_en:
+        fig = create_fig(pat_yz_vis, pk_yz, yz_ang, yz_bw, yz_sll, "YZ Cut")
+        yz_spot.plotly_chart(fig, use_container_width=True, key="chart_yz_fixed")
+    else:
+        yz_spot.info("YZ Cut Disabled")
+
+    # 3. Table
     phases = best_genes[opt.sys.map_idx].reshape(Nx, Ny)
     df = pd.DataFrame(phases, index=[f"X{i+1}" for i in range(Nx)], columns=[f"Y{i+1}" for i in range(Ny)])
-    table_spot.dataframe(df.style.background_gradient(cmap="Oranges", vmin=-180, vmax=180).format("{:.1f}"), use_container_width=True)
+    # 移除 .background_gradient 以避免 matplotlib 報錯
+    table_spot.dataframe(df.style.format("{:.1f}"), use_container_width=True)
     
-    status_msg = "Running... 🔥" if st.session_state.running else "Paused ⏸️"
-    status_spot.info(f"Status: {status_msg} | Algorithm: {algo}")
+    # Status
+    msg = "Running... 🔥" if st.session_state.running else "Paused ⏸️"
+    status_spot.info(f"Status: {msg} | Algorithm: {algo}")
 
-# --- 9. 迴圈控制 ---
+# --- 8. 主循環控制 (Main Loop) ---
+
 if st.session_state.running:
-    frames_per_run = 10 
-    steps_per_frame = 2 
-    for f in range(frames_per_run):
-        for _ in range(steps_per_frame):
-            opt.step(algo, goals)
-        update_view()
-        time.sleep(0.02)
+    # 1. 批次運算 (數學計算，不更新 UI)
+    steps_per_frame = 30
+    for _ in range(steps_per_frame):
+        opt.step(algo, goals)
+    
+    # 2. 更新一次畫面 (固定 Key)
+    update_view()
+    
+    # 3. 觸發下一幀
+    time.sleep(0.01)
     st.rerun()
+
 else:
+    # 暫停或初始狀態
     if opt.iteration == 0:
-        # 初始計算一次
-        p_xz, p_yz = opt.sys.calculate_pattern(opt.pop[0].reshape(1,-1))
+        # 確保初始有分數
+        p_xz, p_yz = opt.sys.calculate_pattern(opt.pop[0].reshape(1, -1))
         opt.gbest_score = opt.evaluate(p_xz, p_yz, goals)[0]
         opt.gbest_pos = opt.pop[0]
+        
     update_view()

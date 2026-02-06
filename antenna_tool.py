@@ -3,7 +3,6 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import time
-import uuid  # 必備：防止元件 ID 重複
 
 # --- 1. 頁面設定 ---
 st.set_page_config(page_title="PyAntenna Cloud", layout="wide", page_icon="📡")
@@ -113,7 +112,8 @@ class Optimizer:
         self.reset() 
 
     def reset(self):
-        # 初始歸零
+        # 初始歸零：第一個個體全 0 (Phase=0)，其餘隨機
+        # 這樣一開始的場型就會是漂亮的 Broadside
         self.pop = np.random.uniform(-180, 180, (self.pop_size, self.dim))
         self.pop[0] = np.zeros(self.dim)
         self.scores = np.full(self.pop_size, np.inf)
@@ -268,21 +268,23 @@ with st.sidebar:
     st.header("⚙️ 控制台")
     algo = st.selectbox("Algorithm", ["DE (差分進化)", "GA (基因算法)", "Random (隨機)"])
     min_gain_val = st.number_input("Min Gain (dBi)", -20.0, 50.0, 10.0)
-    bw_def = st.number_input("BW Def (dB)", -20.0, -0.1, -3.0)
+    bw_def = st.number_input("BW Definition (dB)", -20.0, -0.1, -3.0)
     mask_w = st.slider("Mask Penalty", 1, 500, 50)
     
     col_a, col_b, col_c = st.columns(3)
     if col_a.button("▶ 開始", type="primary"):
         st.session_state.running = True
+        st.rerun() # 立即觸發
     if col_b.button("⏸ 暫停"):
         st.session_state.running = False
+        st.rerun()
     if col_c.button("🔄 重置"):
         if st.session_state.opt:
             st.session_state.opt.reset() 
         st.session_state.running = False
         st.rerun()
 
-# --- 5. 初始化 ---
+# --- 5. 初始化與參數注入 ---
 
 if st.session_state.opt is None:
     sys = AntennaSystem(Nx, Ny, freq, space, gain, q, jio, sym)
@@ -298,97 +300,93 @@ goals = {
     'bw_def': bw_def, 'min_gain': min_gain_val, 'mask_w': mask_w
 }
 
-# --- 6. 靜態容器 ---
-metric_spot = st.empty()
-col_g1, col_g2 = st.columns(2)
-with col_g1: xz_spot = st.empty()
-with col_g2: yz_spot = st.empty()
-table_spot = st.empty()
-status_spot = st.empty()
+# --- 6. 運算邏輯 (st.rerun 迴圈) ---
 
-# --- 7. 更新邏輯 (含 UUID 修復) ---
-
-def update_view():
-    best_idx = np.argmin(opt.scores) if not np.isinf(np.min(opt.scores)) else 0
-    
-    pat_xz, pat_yz = opt.sys.calculate_pattern(opt.pop[best_idx:best_idx+1])
-    pat_xz = pat_xz.flatten()
-    pat_yz = pat_yz.flatten()
-    angles = opt.sys.angles
-    
-    pk_xz = np.max(pat_xz)
-    pk_yz = np.max(pat_yz)
-    cost = opt.scores[best_idx]
-    
-    # 1. Metrics
-    with metric_spot.container():
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Iterations", opt.iteration)
-        c2.metric("Cost", f"{cost:.4f}" if not np.isinf(cost) else "0.0")
-        c3.metric("XZ Peak", f"{pk_xz:.2f} dBi")
-        c4.metric("YZ Peak", f"{pk_yz:.2f} dBi")
-        
-    # 2. Charts (Fix: Visual Clamp + Unique Key)
-    def plot_cut(spot, pat, peak, ang, bw, sll, title, key_id):
-        floor = peak - 60
-        pat_vis = np.maximum(pat, floor)
-        
-        fig = go.Figure()
-        
-        # Mask
-        fig.add_shape(type="rect", x0=ang-bw/2, x1=ang+bw/2, y0=floor, y1=peak+50, 
-                      fillcolor="rgba(46, 204, 113, 0.1)", line_width=0)
-        
-        # SLL
-        mask_val = peak - sll
-        fig.add_shape(type="line", x0=-90, x1=90, y0=mask_val, y1=mask_val, 
-                      line=dict(color="red", width=2, dash="dot"))
-        
-        # Trace
-        fig.add_trace(go.Scatter(x=angles, y=pat_vis, mode='lines', line=dict(width=3)))
-        
-        # Y Axis Scale
-        max_possible_gain = gain + 10*np.log10(Nx*Ny) + 5
-        fig.update_layout(
-            title=title, xaxis_title="Angle", yaxis_title="dBi",
-            yaxis=dict(range=[floor, max_possible_gain]), 
-            xaxis=dict(range=[-90, 90]),
-            height=350, margin=dict(l=20, r=20, t=40, b=20)
-        )
-        # !!! 關鍵修復：使用 uuid 生成每次不重複的 key !!!
-        spot.plotly_chart(fig, use_container_width=True, key=key_id)
-
-    # 每次呼叫都給一個新的 ID，避免 Streamlit 報錯
-    if xz_en: plot_cut(xz_spot, pat_xz, pk_xz, xz_ang, xz_bw, xz_sll, "XZ Cut", f"xz_{uuid.uuid4()}")
-    if yz_en: plot_cut(yz_spot, pat_yz, pk_yz, yz_ang, yz_bw, yz_sll, "YZ Cut", f"yz_{uuid.uuid4()}")
-    
-    # 3. Table
-    best_genes = opt.pop[best_idx]
-    phases = best_genes[opt.sys.map_idx].reshape(Nx, Ny)
-    df = pd.DataFrame(phases, index=[f"X{i+1}" for i in range(Nx)], columns=[f"Y{i+1}" for i in range(Ny)])
-    table_spot.dataframe(df.style.background_gradient(cmap="Oranges", vmin=-180, vmax=180).format("{:.1f}"), use_container_width=True)
-    
-    status_msg = "Running... 🔥" if st.session_state.running else "Paused ⏸️"
-    status_spot.info(f"Status: {status_msg} | Algorithm: {algo}")
-
-# --- 8. 迴圈控制 ---
-
+# 如果是執行狀態，先跑一波運算
 if st.session_state.running:
-    frames_per_run = 10 
-    steps_per_frame = 2 
-    
-    for f in range(frames_per_run):
-        for _ in range(steps_per_frame):
-            best_cost = opt.step(algo, goals)
-        
-        update_view()
-        time.sleep(0.02)
-    
-    st.rerun()
+    # 批次運算: 增加這個數字可以加快收斂，但會降低畫面更新率
+    batch_size = 30
+    for _ in range(batch_size):
+        best_cost = opt.step(algo, goals)
 
-else:
-    if opt.iteration == 0:
-        p_xz, p_yz = opt.sys.calculate_pattern(opt.pop)
-        opt.scores = opt.evaluate(p_xz, p_yz, goals)
+# --- 7. 更新畫面 (只畫一次) ---
+
+best_idx = np.argmin(opt.scores) if not np.isinf(np.min(opt.scores)) else 0
+pat_xz, pat_yz = opt.sys.calculate_pattern(opt.pop[best_idx:best_idx+1])
+pat_xz = pat_xz.flatten()
+pat_yz = pat_yz.flatten()
+angles = opt.sys.angles
+
+pk_xz = np.max(pat_xz)
+pk_yz = np.max(pat_yz)
+cost = opt.scores[best_idx]
+
+# Metrics
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Iterations", opt.iteration)
+c2.metric("Cost", f"{cost:.4f}" if not np.isinf(cost) else "0.0")
+c3.metric("XZ Peak", f"{pk_xz:.2f} dBi")
+c4.metric("YZ Peak", f"{pk_yz:.2f} dBi")
+
+# Charts (固定 Key 防止閃爍與報錯)
+col_g1, col_g2 = st.columns(2)
+
+# Y 軸 Scale 固定邏輯 (防止 Q 導致無限小)
+floor = max(pk_xz, pk_yz) - 60
+pat_xz_vis = np.maximum(pat_xz, floor)
+pat_yz_vis = np.maximum(pat_yz, floor)
+max_possible_gain = gain + 10*np.log10(Nx*Ny) + 5
+
+def create_fig(pat, peak, ang, bw, sll, title):
+    fig = go.Figure()
     
-    update_view()
+    # Mask
+    fig.add_shape(type="rect", x0=ang-bw/2, x1=ang+bw/2, y0=floor, y1=peak+50, 
+                  fillcolor="rgba(46, 204, 113, 0.1)", line_width=0)
+    # SLL
+    mask_val = peak - sll
+    fig.add_shape(type="line", x0=-90, x1=90, y0=mask_val, y1=mask_val, 
+                  line=dict(color="red", width=2, dash="dot"))
+    # Trace
+    fig.add_trace(go.Scatter(x=angles, y=pat, mode='lines', line=dict(width=3)))
+    
+    fig.update_layout(
+        title=title, xaxis_title="Angle", yaxis_title="dBi",
+        yaxis=dict(range=[floor, max_possible_gain]), 
+        xaxis=dict(range=[-90, 90]),
+        height=350, margin=dict(l=20, r=20, t=40, b=20)
+    )
+    return fig
+
+with col_g1:
+    if xz_en:
+        fig_xz = create_fig(pat_xz_vis, pk_xz, xz_ang, xz_bw, xz_sll, "XZ Cut")
+        # 關鍵：使用固定的 key
+        st.plotly_chart(fig_xz, use_container_width=True, key="plot_xz_fixed")
+    else:
+        st.info("XZ Cut Disabled")
+
+with col_g2:
+    if yz_en:
+        fig_yz = create_fig(pat_yz_vis, pk_yz, yz_ang, yz_bw, yz_sll, "YZ Cut")
+        # 關鍵：使用固定的 key
+        st.plotly_chart(fig_yz, use_container_width=True, key="plot_yz_fixed")
+    else:
+        st.info("YZ Cut Disabled")
+
+# Table
+best_genes = opt.pop[best_idx]
+phases = best_genes[opt.sys.map_idx].reshape(Nx, Ny)
+df = pd.DataFrame(phases, index=[f"X{i+1}" for i in range(Nx)], columns=[f"Y{i+1}" for i in range(Ny)])
+st.subheader("🎛️ Phase Matrix (Degrees)")
+# 移除 background_gradient 以避免 matplotlib 錯誤，改用純數據顯示
+st.dataframe(df.style.format("{:.1f}"), use_container_width=True)
+
+# 狀態列
+status_msg = "Running... 🔥" if st.session_state.running else "Paused ⏸️"
+st.info(f"Status: {status_msg} | Algorithm: {algo}")
+
+# 自動重跑 (如果是執行狀態)
+if st.session_state.running:
+    time.sleep(0.01) # 讓瀏覽器喘口氣
+    st.rerun()
